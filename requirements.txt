@@ -1,0 +1,10 @@
+fastapi==0.120.0
+uvicorn[standard]==0.38.0
+langgraph==1.0.10
+langchain-openai==1.6.7
+pydantic==2.12.3
+python-dateutil==2.9.0.post0
+python-dotenv==1.1.1
+
+
+# .\.venv\Scripts\python.exe scripts\chat_terminal.py
