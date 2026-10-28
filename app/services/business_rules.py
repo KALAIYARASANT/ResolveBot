@@ -5,9 +5,21 @@ from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 
 from app.core.config import get_settings
+from app.core.ids import normalize_id
 from app.db.database import connect, owned_order, policy_parameter
 
 TODAY = date.fromisoformat(get_settings().app_today)
+
+
+def _now() -> str:
+    """Row timestamp: the business date (APP_TODAY) with the wall-clock time of day."""
+    return datetime.combine(TODAY, datetime.now().time()).isoformat(timespec="seconds")
+
+
+def _normalize_items(item_ids):
+    if isinstance(item_ids, str):
+        item_ids = [item_ids]
+    return [normalize_id(item) for item in item_ids or []]
 
 
 def _result(ok: bool, code: str | None = None, message: str | None = None, **extra):
@@ -31,6 +43,7 @@ def check_return_eligibility(customer_id: str, order_id: str, item_ids: list[str
 
 
 def _check_return_eligibility(db, customer_id, order_id, item_ids, reason):
+    order_id, item_ids = normalize_id(order_id), _normalize_items(item_ids)
     order = owned_order(db, order_id, customer_id)
     if not order:
         return _result(False, "ORDER_NOT_FOUND", "I couldn't find that order on your account.")
@@ -77,6 +90,7 @@ def check_warranty(customer_id: str, order_id: str):
 
 
 def _check_warranty(db, customer_id: str, order_id: str):
+    order_id = normalize_id(order_id)
     order = owned_order(db, order_id, customer_id)
     if not order:
         return _result(False, "ORDER_NOT_FOUND", "I couldn't find that order on your account.")
@@ -110,6 +124,7 @@ def validate_ticket(customer_id: str, order_id: str, ticket_type: str, summary: 
 
 
 def _validate_ticket(db, customer_id, order_id, ticket_type, summary):
+    order_id = normalize_id(order_id)
     order = owned_order(db, order_id, customer_id)
     if not order:
         return _result(False, "ORDER_NOT_FOUND", "I couldn't find that order on your account.")
@@ -119,28 +134,60 @@ def _validate_ticket(db, customer_id, order_id, ticket_type, summary):
             return checked
     elif order["status"] != "processing":
         return _result(False, "ORDER_ALREADY_SHIPPED", "This order can no longer be cancelled because it has shipped.")
+    elif db.execute("SELECT 1 FROM support_tickets WHERE customer_id=? AND order_id=? AND ticket_type='cancellation' AND status='open'",
+                    (customer_id, order_id)).fetchone():
+        return _result(False, "ALREADY_REQUESTED", "A cancellation ticket is already open for this order.")
     return _result(True, message="Ticket request is eligible.", order_id=order_id, ticket_type=ticket_type, summary=summary)
 
 
+def _duplicate_return(db, customer_id, order_id, item_ids):
+    """Request ID of an existing return that already covers any of these items, if there is one."""
+    wanted = set(item_ids)
+    for row in db.execute("SELECT request_id, item_ids FROM return_requests WHERE customer_id=? AND order_id=?", (customer_id, order_id)):
+        try:
+            if wanted & set(json.loads(row["item_ids"])):
+                return row["request_id"]
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _check_return_request(db, customer_id, order_id, item_ids, reason):
+    """Eligibility plus the duplicate guard; the single check behind both the proposal and the write."""
+    valid = _check_return_eligibility(db, customer_id, order_id, item_ids, reason)
+    if valid["eligible"] and _duplicate_return(db, customer_id, normalize_id(order_id), _normalize_items(item_ids)):
+        return _result(False, "ALREADY_REQUESTED", "A return request already exists for one of these items.")
+    return valid
+
+
+def check_return_request(customer_id: str, order_id: str, item_ids: list[str], reason: str):
+    with connect() as db:
+        return _check_return_request(db, customer_id, order_id, item_ids, reason)
+
+
 def create_return_request(customer_id: str, order_id: str, item_ids: list[str], reason: str):
+    order_id, item_ids = normalize_id(order_id), _normalize_items(item_ids)
     request_id = str(uuid.uuid4())
     with connect() as db:
-        valid = _check_return_eligibility(db, customer_id, order_id, item_ids, reason)
+        db.execute("BEGIN IMMEDIATE")  # the duplicate check and the insert must not interleave with another writer
+        valid = _check_return_request(db, customer_id, order_id, item_ids, reason)
         if not valid["eligible"]:
             return valid
         db.execute("INSERT INTO return_requests VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (request_id, order_id, customer_id, json.dumps(item_ids), reason, "requested", datetime.now().isoformat(timespec="seconds")))
+            (request_id, order_id, customer_id, json.dumps(item_ids), reason, "requested", _now()))
         db.commit()
     return {"created": True, "request_id": request_id, "status": "requested"}
 
 
 def create_support_ticket(customer_id: str, order_id: str, ticket_type: str, summary: str):
+    order_id = normalize_id(order_id)
     ticket_id = str(uuid.uuid4())
     with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         valid = _validate_ticket(db, customer_id, order_id, ticket_type, summary)
         if not valid["eligible"]:
             return valid
         db.execute("INSERT INTO support_tickets VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ticket_id, order_id, customer_id, ticket_type, summary, "open", datetime.now().isoformat(timespec="seconds")))
+            (ticket_id, order_id, customer_id, ticket_type, summary, "open", _now()))
         db.commit()
     return {"created": True, "ticket_id": ticket_id, "status": "open"}

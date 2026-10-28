@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from app.core.config import get_settings
+from app.core.ids import normalize_id
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -39,7 +40,7 @@ def customer_exists(customer_id: str) -> bool:
 
 
 def owned_order(db: sqlite3.Connection, order_id: str, customer_id: str):
-    return db.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=?", (order_id, customer_id)).fetchone()
+    return db.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=?", (normalize_id(order_id), customer_id)).fetchone()
 
 
 def policy_parameter(db: sqlite3.Connection, key: str) -> str | None:

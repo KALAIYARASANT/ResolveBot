@@ -15,6 +15,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 router = APIRouter()
 REQUEST_TIMEOUT_SECONDS = 27.0
+SESSION_TTL_SECONDS = 3600   # an idle chat (and any proposal waiting in it) is forgotten after an hour
+MAX_SESSIONS = 1000
+MAX_HISTORY_MESSAGES = 40    # the agent only reads the last 12; keep a little more
 
 
 @dataclass
@@ -24,9 +27,23 @@ class Session:
     pending: dict | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     confirmed_action_reply: str | None = None
+    last_used: float = field(default_factory=time.monotonic)
 
 
 SESSIONS: dict[str, Session] = {}
+
+
+def evict_sessions(now: float | None = None) -> None:
+    """Drop idle sessions, then the least recently used ones beyond MAX_SESSIONS. Busy sessions are never dropped."""
+    now = time.monotonic() if now is None else now
+    for sid, session in list(SESSIONS.items()):
+        if now - session.last_used > SESSION_TTL_SECONDS and not session.lock.locked():
+            del SESSIONS[sid]
+    excess = len(SESSIONS) - MAX_SESSIONS
+    if excess > 0:
+        for sid in sorted(SESSIONS, key=lambda key: SESSIONS[key].last_used)[:excess]:
+            if not SESSIONS[sid].lock.locked():
+                del SESSIONS[sid]
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -40,11 +57,13 @@ async def chat(request: Request, x_customer_id: str | None = Header(default=None
         body = ChatRequest.model_validate(payload)
     except (json.JSONDecodeError, ValidationError, ValueError, TypeError):
         return JSONResponse(status_code=400, content={"detail": "Invalid JSON or missing/invalid required request fields"})
+    evict_sessions()
     session = SESSIONS.get(body.session_id)
     if session and session.customer_id != x_customer_id:
         return JSONResponse(status_code=403, content={"detail": "Session belongs to a different customer"})
     if not session:
         session = SESSIONS[body.session_id] = Session(customer_id=x_customer_id)
+    session.last_used = time.monotonic()
     async with session.lock:
         previous_pending = session.pending
         was_confirmation = bool(previous_pending and is_clear_confirmation(body.message))
@@ -82,5 +101,7 @@ async def chat(request: Request, x_customer_id: str | None = Header(default=None
             session.confirmed_action_reply = None
         session.pending = new_proposal
         session.history.extend([HumanMessage(content=body.message), AIMessage(content=answer)])
+        del session.history[:-MAX_HISTORY_MESSAGES]
+        session.last_used = time.monotonic()
     return {"request_id": request_id, "answer": answer, "route": route, "citations": citations,
             "tool_calls": calls, "pending_confirmation": pending}

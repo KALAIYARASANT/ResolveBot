@@ -2,9 +2,10 @@ from typing import Optional
 from datetime import date
 from langchain_core.tools import tool
 
+from app.core.ids import normalize_id
 from app.db.database import connect
 from app.services.business_rules import (
-    TODAY, check_return_eligibility as business_check_return,
+    TODAY, check_return_eligibility as business_check_return, check_return_request,
     create_return_request as write_return_request,
     create_support_ticket as write_support_ticket,
     validate_ticket, warranty_status,
@@ -22,7 +23,7 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
             sql = "SELECT * FROM orders WHERE customer_id=?"
             params = [customer_id]
             if order_id:
-                sql += " AND order_id=?"; params.append(order_id)
+                sql += " AND order_id=?"; params.append(normalize_id(order_id))
             if status:
                 sql += " AND status=?"; params.append(status)
             orders = db.execute(sql + " ORDER BY order_date DESC", params).fetchall()
@@ -35,7 +36,7 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
                 item_data = []
                 for item in items:
                     warranty = warranty_status(db, item) if item["delivered_at"] else None
-                    item_data.append({"item_id": item["item_id"], "name": item["name"], "qty": item["qty"],
+                    item_data.append({"item_id": item["item_id"], "name": item["name"], "category": item["category"], "qty": item["qty"],
                                       "opened": bool(item["opened"]),
                                       "warranty_end_date": warranty.get("warranty_end_date") if warranty else None,
                                       "warranty_active": bool(warranty and warranty.get("warranty_active")),
@@ -51,7 +52,7 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
 
     @tool
     def search_policy(query: str) -> dict:
-        """Search current ShopSphere policies and FAQs. Returns only applicable excerpts with citation doc_id and section."""
+        """Search current ShopSphere policies and FAQs. Returns only applicable excerpts with citation doc_id and section. Include any date the customer mentions in the query."""
         return retrieve_policy(query)
 
     @tool
@@ -66,9 +67,10 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
             return {"error_code": "ACTION_NOT_REQUESTED", "message": "The customer has not requested a new return action."}
         if proposal_state:
             return {"error_code": "ONE_PROPOSAL_AT_A_TIME", "message": "Only one write action can be proposed per message."}
-        valid = business_check_return(customer_id, order_id, item_ids, reason)
+        valid = check_return_request(customer_id, order_id, item_ids, reason)
         if not valid["eligible"]:
             return valid
+        order_id, item_ids = normalize_id(order_id), [normalize_id(item) for item in item_ids]
         proposal = {"kind": "return", "order_id": order_id, "item_ids": item_ids, "reason": reason}
         proposal_state.update(proposal)
         proposal_callback(proposal)
@@ -84,6 +86,7 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
         valid = validate_ticket(customer_id, order_id, ticket_type, summary)
         if not valid["eligible"]:
             return valid
+        order_id = normalize_id(order_id)
         proposal = {"kind": "ticket", "order_id": order_id, "ticket_type": ticket_type, "summary": summary}
         proposal_state.update(proposal)
         proposal_callback(proposal)
