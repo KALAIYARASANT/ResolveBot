@@ -33,6 +33,14 @@ curl.exe -X POST http://localhost:8000/chat `
 
 The only endpoint is `POST /chat` on port 8000. It requires `X-Customer-Id` and a JSON body with `session_id` and `message`. Each successful response has a unique `request_id`, `answer`, one of `answer`, `clarify`, `no_answer`, or `out_of_scope`, citations, chronologically ordered tool calls, and `pending_confirmation`.
 
+Each `tool_calls` entry is `{"name": ..., "args": {...}, "status": "success" | "error" | "pending_confirmation"}`, listing the tools actually run for that message, in order. `args` is exactly what the tool received (for example `get_orders` called without a filter has `"args": {}`). A confirmed write returns `create_return_request` or `create_support_ticket` with status `success` and `pending_confirmation: false`. JSON keeps `§` as a readable character.
+
+To inspect the full response while chatting in the terminal, start the script with `--show-json`; it prints the complete JSON, route, citations, tool calls, and pending status after each answer:
+
+```powershell
+.venv\Scripts\python.exe scripts\chat_terminal.py --show-json
+```
+
 ## Architecture
 
 - `app/main.py` creates the FastAPI application.
@@ -55,11 +63,11 @@ The retriever splits the configured Markdown file by document ID and numbered he
 
 Return eligibility runs in Python, reading `return_window_days` from SQLite. Day zero is delivery and the last configured day is included. Product return restrictions, opened-item rules, order ownership, item membership, delivery, and reason are checked before proposing a return. Warranty end dates use the configured standard or extended month count and calendar-month arithmetic (`relativedelta`); the end date is covered.
 
-The customer first gets a proposal and confirmation question. No database row is inserted on that turn. A clear affirmative on the very next message executes the proposed action after revalidation; any other next message discards it. Session requests are serialized, and a repeated affirmative after a completed action cannot create a duplicate row. An imperative such as `just do it` is not confirmation. Customer dates without a year are interpreted as dates in 2026. Return requests use status `requested`; support tickets use status `open`.
+The customer first gets a proposal that ends with "Shall I go ahead?", `pending_confirmation: true`, and a `create_return_request` or `create_support_ticket` record with status `pending_confirmation` in `tool_calls`. A return proposal runs `get_orders` (filtered to the named order), `search_policy` ("return window"), and `check_return_eligibility` first, states the days since delivery and the configured window, and cites the return-window clause (`returns_policy` §2.1). A question such as "Can I return it? I changed my mind." only gets an eligibility answer and an offer. No database row is inserted on that turn. A clear affirmative on the very next message executes the proposed action after revalidation; any other next message discards it. Session requests are serialized, and a repeated affirmative after a completed action cannot create a duplicate row. An imperative such as `just do it` is not confirmation. Customer dates without a year are interpreted as dates in 2026. Return requests use status `requested`; support tickets use status `open`.
 
 ## Privacy and assumptions
 
-Every order lookup is scoped to the customer header; unknown and other-customer orders have the same `ORDER_NOT_FOUND` response. A session is tied to its first customer and a different customer receives HTTP 403. Missing or unknown customer IDs receive HTTP 401; invalid request JSON or required fields receive HTTP 400. Order-not-found is a normal HTTP 200 outcome.
+Every order lookup is scoped to the customer header; unknown and other-customer orders have the same `ORDER_NOT_FOUND` response, including when a return request names an order that is not on the account (route `no_answer`, "I couldn't find that order on your account."). A session is tied to its first customer and a different customer receives HTTP 403. Missing or unknown customer IDs receive HTTP 401; invalid request JSON or required fields receive HTTP 400. Order-not-found is a normal HTTP 200 outcome.
 
 Sessions are held in process memory, so they reset on restart and are not shared across multiple server workers. Use one worker for this assessment. The API key is optional for startup; without it only deterministic order lookup and excerpt-based policy fallback work, while the full natural-language agent and confirmation proposal workflow require OpenAI. The default model, `gpt-6-luna`, supports Chat Completions function calling when reasoning is disabled; ResolveBot sends `reasoning_effort="none"` and `temperature=0`. The request workflow has a 27-second processing timeout to leave time for HTTP handling within the 30-second requirement. The supplied source data and schema are not changed.
 

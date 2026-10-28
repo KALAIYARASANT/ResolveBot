@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -7,6 +8,8 @@ from langgraph.graph import END, StateGraph, add_messages
 
 from app.core.config import get_settings
 from app.core.dates import add_default_year
+from app.db.database import connect, policy_parameter
+from app.services.business_rules import TODAY
 from app.services.policy_search import search_policy
 from app.tools.support_tools import build_tools, execute_proposal
 
@@ -42,7 +45,8 @@ def allows_new_proposal(message: str, previous_proposal: dict | None) -> bool:
     text = message.strip()
     if is_clear_confirmation(text) or re.fullmatch(r"(?:just\s+)?do it[.!\s]*", text, re.I):
         return False
-    if re.search(r"\?\s*$", text):
+    # A question about an action ("Can I return it? It's defective.") is a question even when more text follows.
+    if re.search(r"\?\s*$", text) or any(_ACTION_REQUEST.search(q) for q in re.findall(r"[^.!?]*\?", text)):
         explicit_request = re.match(r"\s*(?:can|could|would)\s+you\s+(?:please\s+)?(?:return|cancel|create|open|submit|file|request|ticket|claim)\b", text, re.I)
         if not explicit_request and not re.search(r"\b(?:please|i want to|i'd like to)\b", text, re.I):
             return False
@@ -67,7 +71,7 @@ class AgentState(TypedDict, total=False):
     tool_limit_reached: bool
 
 
-SYSTEM = """You are ResolveBot, ShopSphere customer support. Use tools for order facts and policy questions. Never invent facts, policies, IDs, or eligibility. Return eligibility is determined only by the Python tool. Never ask for or accept customer ID; it comes from trusted request context. Customers do not need to know an order ID: use get_orders to find their own products when appropriate. If an item or order is missing or several products/orders match, list the relevant account choices and ask which one; ask for every missing eligibility detail, including reason, together. Do not check every account item when a broad question has not identified an item. You may answer multiple questions in one message. For a direct policy answer, rely only on search_policy excerpts. Do not add document IDs, section numbers, or citation lists to the customer-facing answer; citations are returned separately in the API response. If coverage is missing, say ShopSphere policies do not cover that question and suggest emailing the support team. If an excerpt identifies a future policy, state its effective date and distinguish it from current policy. If a request is unrelated to ShopSphere, reply that you can only help with ShopSphere support. For a possible write, propose only when the customer clearly requests the action; questions like 'Can I return this?' ask for eligibility only. A proposal is not an execution: explain it and ask for explicit confirmation. Tool writes are gated by Python and confirmation. Customer dates without a year refer to 2026. Keep answers concise and customer-friendly."""
+SYSTEM = """You are ResolveBot, ShopSphere customer support. Use tools for order facts and policy questions. Never invent facts, policies, IDs, or eligibility. Return eligibility is determined only by the Python tool. Never ask for or accept customer ID; it comes from trusted request context. Customers do not need to know an order ID: use get_orders to find their own products when appropriate. If an item or order is missing or several products/orders match, list the relevant account choices and ask which one; ask for every missing eligibility detail, including reason, together. Do not check every account item when a broad question has not identified an item. You may answer multiple questions in one message. For a direct policy answer, rely only on search_policy excerpts. Do not add document IDs, section numbers, or citation lists to the customer-facing answer; citations are returned separately in the API response. If coverage is missing, say ShopSphere policies do not cover that question and suggest emailing the support team. If an excerpt identifies a future policy, state its effective date and distinguish it from current policy. If a request is unrelated to ShopSphere, reply that you can only help with ShopSphere support. For a possible write, propose only when the customer clearly requests the action; questions like 'Can I return this?' ask for eligibility only. A proposal is not an execution: describe what you will do and end the reply with exactly "Shall I go ahead?". Tool writes are gated by Python and confirmation. Customer dates without a year refer to 2026. Keep answers concise and customer-friendly."""
 
 
 def _citation_merge(current, result):
@@ -102,6 +106,21 @@ _RETURN_REASON_DEFECTIVE = re.compile(r"\b(?:defective|broken|damaged|wrong\s+it
 _RETURN_DETAIL_CHANGE = re.compile(r"\b(?:actually|instead|switch|change|replace|use)\b", re.I)
 _SELECTED_RETURN_CONTEXT = re.compile(r"(?:I found your|^The|You'd like to proceed with a return for) (?P<name>.+?) \(order (?P<order>SS-\d+), item (?P<item>SS-\d+-\d+)\)", re.I)
 _RETURN_REASON_QUESTION = "Was the reason that you changed your mind, or that the item is defective?"
+_CONFIRM_QUESTION = "Shall I go ahead?"
+_ORDER_NOT_FOUND_ANSWER = "I couldn't find that order on your account."
+
+
+def _order_not_found_turn(customer_id: str, message: str, entries: list[dict], prior_records: list[dict]):
+    """A referenced order that is not on this account gets the same ORDER_NOT_FOUND reply as an unknown one."""
+    reference = re.search(r"\bSS-\d+\b", message, re.I)
+    if not reference or any(entry["order_id"].casefold() == reference.group(0).casefold() for entry in entries):
+        return None
+    order_id = reference.group(0).upper()
+    result = build_tools(customer_id, lambda _: None, allow_proposals=False)[0].invoke({"order_id": order_id})
+    if result.get("error_code") != "ORDER_NOT_FOUND":
+        return None
+    record = {"name": "get_orders", "args": {"order_id": order_id}, "status": "error"}
+    return _ORDER_NOT_FOUND_ANSWER, "no_answer", prior_records + [record], [], False, None
 
 
 def _return_reason(text: str) -> str | None:
@@ -146,15 +165,46 @@ def _return_reason_in_history(history: list[Any]) -> str | None:
     return None
 
 
-def _account_items(customer_id: str):
-    tool = build_tools(customer_id, lambda _: None, allow_proposals=False)[0]
-    result = tool.invoke({})
+def _order_entries(result: dict) -> list[dict]:
     entries = []
     for order in result.get("orders", []):
         for item in order.get("items", []):
             entries.append({"order_id":order["order_id"],"status":order["status"],
                             "item_id":item["item_id"],"name":item["name"]})
-    return tool, entries
+    return entries
+
+
+def _account_items(customer_id: str):
+    tool = build_tools(customer_id, lambda _: None, allow_proposals=False)[0]
+    return tool, _order_entries(tool.invoke({}))
+
+
+def _lookup_account(customer_id: str, order_id: str | None = None):
+    """Run get_orders (filtered when the customer named an order); return its record and item entries."""
+    tool = build_tools(customer_id, lambda _: None, allow_proposals=False)[0]
+    args = {"order_id": order_id} if order_id else {}
+    result = tool.invoke(args)
+    record = {"name": "get_orders", "args": args, "status": "error" if result.get("error_code") else "success"}
+    return record, _order_entries(result)
+
+
+def _return_window_policy(customer_id: str):
+    """Run search_policy for the return window; cite only its best-matching clause, which the proposal relies on."""
+    args = {"query": "return window"}
+    result = build_tools(customer_id, lambda _: None, allow_proposals=False)[1].invoke(args)
+    record = {"name": "search_policy", "args": args, "status": "error" if result.get("error") else "success"}
+    return record, (result.get("citations", [])[:1] if result.get("covered") else [])
+
+
+def _return_window_sentence(order_id: str) -> str:
+    """Days since delivery and the window, both read at runtime (shipments and policy_parameters)."""
+    with connect() as db:
+        row = db.execute("SELECT delivered_at FROM shipments WHERE order_id=?", (order_id,)).fetchone()
+        window = policy_parameter(db, "return_window_days")
+    if not row or not row["delivered_at"] or window is None:
+        return ""
+    days = (TODAY - date.fromisoformat(row["delivered_at"][:10])).days
+    return f" It was delivered {days} {'day' if days == 1 else 'days'} ago, within the {window}-day return window."
 
 
 def _revise_pending_return(customer_id: str, proposal: dict, message: str):
@@ -171,6 +221,9 @@ def _revise_pending_return(customer_id: str, proposal: dict, message: str):
     if item_identifier or (change_signal and reason is None):
         get_orders,entries=_account_items(customer_id)
         records.append(_get_orders_record(get_orders))
+        not_found=_order_not_found_turn(customer_id,message,entries,records)
+        if not_found is not None:
+            return not_found
         matches=_matching_account_items(message,entries)
         unique={(entry["order_id"],entry["item_id"]):entry for entry in matches}
         matches=list(unique.values())
@@ -198,7 +251,7 @@ def _revise_pending_return(customer_id: str, proposal: dict, message: str):
     if not created.get("pending_confirmation"):
         return created.get("message","I couldn't prepare that return."),"answer",records,[],False,None
     label=f"item {item_ids[0]}" if len(item_ids)==1 else "the selected items"
-    answer=f"I updated the return proposal for {label} with reason {reason}. Please confirm again to submit it."
+    answer=f"I updated the return proposal for {label} with reason {reason}. {_CONFIRM_QUESTION}"
     return answer,"answer",records,[],True,proposal_holder.get("value")
 
 
@@ -216,7 +269,12 @@ def _matching_account_items(message: str, entries: list[dict]) -> list[dict]:
         return [entry for entry in entries if entry["item_id"].casefold()==item_id.group(0).casefold()]
     order_id = re.search(r"\bSS-\d+\b",message,re.I)
     if order_id:
-        return [entry for entry in entries if entry["order_id"].casefold()==order_id.group(0).casefold()]
+        in_order=[entry for entry in entries if entry["order_id"].casefold()==order_id.group(0).casefold()]
+        # An item described next to its order ID narrows a multi-item order.
+        described=_item_terms(re.sub(r"\bSS-\d+(?:-\d+)?\b"," ",message))
+        scored=[(len(described & _item_terms(entry["name"])),entry) for entry in in_order]
+        best=max((score for score,_entry in scored),default=0)
+        return [entry for score,entry in scored if score==best] if best else in_order
     terms=_item_terms(message)
     if not terms:
         return []
@@ -282,11 +340,15 @@ def _return_detail_turn(customer_id: str, history: list[Any], message: str, pend
         tools=build_tools(customer_id,lambda _:None,allow_proposals=explicit_action)
         check_tool,create_tool=tools[2],tools[3]
         args={"order_id":selected["order_id"],"item_ids":[selected["item_id"]],"reason":reason}
+        policy_record,policy_citations=_return_window_policy(customer_id)
         checked=check_tool.invoke(args)
-        records=[{"name":"check_return_eligibility","args":args,
-                  "status":"error" if checked.get("error_code") else "success"}]
+        records=[policy_record,{"name":"check_return_eligibility","args":args,
+                                "status":"error" if checked.get("error_code") else "success"}]
         if not checked.get("eligible"):
-            return checked.get("message","That item is not eligible for return."),"answer",offer_lookup_calls+records,[],False,None
+            # The window clause is cited only when the window is the reason for the refusal.
+            cited=policy_citations if checked.get("error_code")=="RETURN_WINDOW_EXPIRED" else []
+            return checked.get("message","That item is not eligible for return."),"answer",offer_lookup_calls+records,cited,False,None
+        window=_return_window_sentence(selected["order_id"])
         if explicit_action:
             proposal_holder={}
             tools=build_tools(customer_id,lambda proposal:proposal_holder.update(value=proposal),allow_proposals=True)
@@ -294,11 +356,11 @@ def _return_detail_turn(customer_id: str, history: list[Any], message: str, pend
             records.append({"name":"create_return_request","args":args,
                             "status":"pending_confirmation" if result.get("pending_confirmation") else "error"})
             if not result.get("pending_confirmation"):
-                return result.get("message","I couldn't prepare that return."),"answer",records,[],False,None
-            answer=f"I can create the return for {selected['name']} (order {selected['order_id']}, item {selected['item_id']}) for reason {reason}. Please reply yes to confirm."
-            return answer,"answer",offer_lookup_calls+records,[],True,proposal_holder.get("value")
-        answer=f"I found your {selected['name']} (order {selected['order_id']}, item {selected['item_id']}). It is eligible for return for reason {reason}. Would you like me to prepare the return?"
-        return answer,"answer",offer_lookup_calls+records,[],False,None
+                return result.get("message","I couldn't prepare that return."),"answer",offer_lookup_calls+records,[],False,None
+            answer=f"I can create the return for {selected['name']} (order {selected['order_id']}, item {selected['item_id']}) for reason {reason}.{window} {_CONFIRM_QUESTION}"
+            return answer,"answer",offer_lookup_calls+records,policy_citations,True,proposal_holder.get("value")
+        answer=f"I found your {selected['name']} (order {selected['order_id']}, item {selected['item_id']}). It is eligible for return for reason {reason}.{window} Would you like me to prepare the return?"
+        return answer,"answer",offer_lookup_calls+records,policy_citations,False,None
 
     # A previous clarification carries the selected database item through the
     # ordinary session history. If the reason is still missing, ask for it.
@@ -318,8 +380,11 @@ def _return_detail_turn(customer_id: str, history: list[Any], message: str, pend
     if not (options_were_shown or is_return_request):
         return None
 
-    get_orders,entries=_account_items(customer_id)
-    get_orders_call=_get_orders_record(get_orders)
+    # When the customer names an order, look up that order: an unknown or foreign one fails here, as ORDER_NOT_FOUND.
+    order_ref=re.search(r"\bSS-\d+\b",message,re.I)
+    get_orders_call,entries=_lookup_account(customer_id,order_ref.group(0).upper() if order_ref else None)
+    if get_orders_call["status"]=="error":
+        return _ORDER_NOT_FOUND_ANSWER,"no_answer",[get_orders_call],[],False,None
     if broad_reference:
         choices=[f"{entry['name']} (order {entry['order_id']}, item {entry['item_id']})" for entry in entries]
         if choices:
@@ -476,7 +541,9 @@ def run_chat(customer_id: str, history: list[Any], message: str, pending: dict |
                 label = "return request" if pending["kind"] == "return" else "support ticket"
                 id_value = result.get("request_id") or result.get("ticket_id")
                 return f"Your {label} has been created. Reference: {id_value}.", "answer", [record], [], False, None
-            return result.get("message", "I couldn't complete that request. Please contact support."), "no_answer", [record], [], False, None
+            # Revalidation refused the write: a "no, because..." reply, not a missing-order or missing-policy one.
+            route = "no_answer" if result.get("error_code") == "ORDER_NOT_FOUND" else "answer"
+            return result.get("message", "I couldn't complete that request. Please contact support."), route, [record], [], False, None
         if is_clear_decline(message):
             label = "return request" if pending["kind"] == "return" else "support ticket"
             return f"Okay, I won't submit the {label}.", "answer", [], [], False, None
@@ -536,8 +603,8 @@ def run_chat(customer_id: str, history: list[Any], message: str, pending: dict |
             elif suffix.casefold() not in answer.casefold():
                 answer = f"{answer} {suffix}".strip()
             return answer, "no_answer", result.get("tool_calls", []), [], bool(proposal), proposal
-        if proposal and not re.search(r"\b(confirm|reply yes|say yes|proceed)\b", answer, re.I):
-            answer = (answer + " Please reply yes if you'd like me to proceed.").strip()
+        if proposal and _CONFIRM_QUESTION.casefold() not in answer.casefold():
+            answer = f"{answer} {_CONFIRM_QUESTION}".strip()
         citations = result.get("citations", [])
         answer_lower = answer.casefold()
         cited = {(c["doc_id"], c["section"]) for c in citations

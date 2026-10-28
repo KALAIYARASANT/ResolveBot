@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import sys
@@ -50,7 +51,9 @@ def customer_exists_read_only(customer_id: str) -> bool:
         db.close()
 
 
-def post_message(customer_id: str, session_id: str, message: str) -> tuple[str, int]:
+def post_message(customer_id: str, session_id: str, message: str) -> tuple[str, int, dict | None]:
+    """Return (answer, elapsed_ns, full API payload); the payload is None when the request failed."""
+    payload = None
     body = json.dumps({"session_id": session_id, "message": message}).encode("utf-8")
     request = Request(
         CHAT_URL,
@@ -89,10 +92,10 @@ def post_message(customer_id: str, session_id: str, message: str) -> tuple[str, 
     except Exception as exc:
         answer = f"Request failed: {type(exc).__name__}: {exc}"
     elapsed_ns = time.perf_counter_ns() - started_ns
-    return answer, elapsed_ns
+    return answer, elapsed_ns, payload
 
 
-def post_message_with_loading(customer_id: str, session_id: str, message: str) -> tuple[str, int]:
+def post_message_with_loading(customer_id: str, session_id: str, message: str) -> tuple[str, int, dict | None]:
     """Animate dots while the synchronous HTTP request waits for the bot."""
     stop = threading.Event()
 
@@ -114,7 +117,27 @@ def post_message_with_loading(customer_id: str, session_id: str, message: str) -
         sys.stdout.flush()
 
 
+def print_json_details(payload: dict | None) -> None:
+    """Show the complete API response plus its key fields, keeping Unicode such as § readable."""
+    if not isinstance(payload, dict):
+        print("(no JSON response body to show)")
+        return
+    print("--- API response (JSON) ---")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print("--- Summary ---")
+    print(f"route: {payload.get('route')}")
+    print("pending_confirmation: " + json.dumps(payload.get("pending_confirmation")))
+    print("citations: " + json.dumps(payload.get("citations"), ensure_ascii=False))
+    print("tool_calls: " + json.dumps(payload.get("tool_calls"), ensure_ascii=False))
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Interactive client for ResolveBot's POST /chat endpoint.")
+    parser.add_argument("--show-json", action="store_true",
+                        help="after each answer, print the complete JSON response, route, citations, tool calls and pending status")
+    show_json = parser.parse_args().show_json
+    if show_json and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     try:
         while True:
             customer_id = input("Enter Customer ID: ").strip()
@@ -135,6 +158,7 @@ def main() -> int:
         print("Customer verified successfully.")
         session_id = str(uuid.uuid4())
         print("Chat started. Type 'exit' to end the session.")
+        message_number = 0
 
         while True:
             try:
@@ -148,9 +172,15 @@ def main() -> int:
             if not message:
                 continue
 
-            answer, elapsed_ns = post_message_with_loading(customer_id, session_id, message)
+            message_number += 1
+            if show_json:
+                request_body = {"session_id": session_id, "message": message}
+                print(f"Message {message_number}: {json.dumps(request_body, ensure_ascii=False)}")
+            answer, elapsed_ns, payload = post_message_with_loading(customer_id, session_id, message)
             answer = answer.replace("**", "")
             print(f"Bot: {answer}")
+            if show_json:
+                print_json_details(payload)
             print(f"Time taken: {elapsed_ns} ns ({elapsed_ns / 1_000_000_000:.9f} seconds)")
             print()
     except KeyboardInterrupt:
