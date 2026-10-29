@@ -52,6 +52,24 @@ To inspect the full response while chatting in the terminal, start the script wi
 .venv\Scripts\python.exe scripts\chat_terminal.py --show-json
 ```
 
+## Clearing test data
+
+Rows written while testing live in two tables. Clear each one separately, with the server stopped (or use a copy of the database):
+
+Return requests (all rows):
+
+```
+.venv\Scripts\python.exe -c "import sqlite3; c = sqlite3.connect('data/shopsphere.db'); c.execute('DELETE FROM return_requests'); c.commit()"
+```
+
+Support tickets (all rows):
+
+```
+.venv\Scripts\python.exe -c "import sqlite3; c = sqlite3.connect('data/shopsphere.db'); c.execute('DELETE FROM support_tickets'); c.commit()"
+```
+
+This is a manual step; the API has no delete endpoint and the schema is unchanged.
+
 ## Architecture
 
 - `app/main.py` creates the FastAPI application.
@@ -76,9 +94,9 @@ The only fixed customer-facing text is what the assessment requires or what appl
 
 ## Policy retrieval and citations
 
-The retriever splits the configured Markdown file by document ID and numbered headings, keeping each section's heading (FAQ questions live in the headings) and the manifest title. It matches each document against `manifest.json`, excludes superseded policies, and excludes future-effective notices from current-policy questions using `APP_TODAY`; a question that mentions a future date or change can include an upcoming notice, labeled with its effective date. Matching is stemmed term overlap with no topic-to-document map: a section needs at least half of a short question's terms (at most two for long queries) to count, so one shared word is not coverage, and every document, FAQ included, competes on the same score (policy wins ties). When two in-force policy sections cover the same topic (same heading and matched terms), the newer document replaces the older one (for example the shipping fee once the update is in force).
+The retriever splits the configured Markdown file by document ID and numbered headings, keeping each section's heading (FAQ questions live in the headings) and the manifest title. It matches each document against `manifest.json`, excludes superseded policies, and excludes future-effective notices from current-policy questions using `APP_TODAY`; a question that mentions a future date or change can include an upcoming notice, labeled with its effective date. Matching is stemmed term overlap with no topic-to-document map: a section needs at least half of a short question's terms (at most two for long queries) to count, so one shared word is not coverage, and every document, FAQ included, competes on the same score (policy wins ties). When two in-force policy sections cover the same topic (same heading and matched terms), the newer document replaces the older one (for example the shipping fee once the update is in force). Sections under the same heading in one document are kept together (a fee and its threshold), and an "Until <date>" rule is dropped once that date has passed.
 
-The model sees at most five excerpts (two per document) and the business date. It ends its reply with a `Sources:` line, which is stripped from the answer. The cited sections are the ones it names that also appear in its answer, plus the one retrieved excerpt the answer overlaps most; an answer that does not use an excerpt cites nothing. No coverage returns `no_answer`, empty citations, and the "policies do not cover that question, email the support team" reply. Questions that are not about ShopSphere (code, sports, weather, ...) return `out_of_scope` with empty `tool_calls` and `citations`. If the model refuses or says "not covered" without searching while the policy files do match the message, the agent gets one retry told to search.
+The model sees at most five excerpts (three per document) and the business date. It ends its reply with a `Sources:` line, which is stripped from the answer. The cited sections are the ones it names that also appear in its answer, plus the one retrieved excerpt the answer overlaps most; an answer that does not use an excerpt cites nothing. No coverage returns `no_answer`, empty citations, and the "policies do not cover that question, email the support team" reply. Questions that are not about ShopSphere (code, sports, weather, ...) return `out_of_scope` with empty `tool_calls` and `citations`. If the model refuses or says "not covered" without searching while the policy files do match the message, the agent gets one retry told to search.
 
 ## Returns, warranties, and cancellation
 
@@ -111,6 +129,7 @@ These examples were checked against the supplied data on `APP_TODAY=2026-07-01`:
 | `C1009`: “Where is order SS-10512?” | “Order SS-10512 is in transit. The estimated delivery date is 2026-07-03.” The `get_orders` call succeeded. |
 | `C1001`: “Where is order SS-10512?” | “I couldn't find that order on your account.” The HTTP response was 200, route was `no_answer`, and `get_orders` recorded an error. |
 | “What is the standard shipping fee?” | The current policy excerpt returns ₹99 per order and cites `shipping_policy`, section `§2.1`. A future-dated policy is excluded from this current-policy query. With `APP_TODAY=2026-08-02` the in-force update applies instead: ₹149, citing `shipping_policy_update` `§1.1`. |
+| “What is your shipping fee and the free shipping threshold? Do Plus members get free shipping?” | Policy-only, so only `search_policy` is called (no `get_orders`). With `APP_TODAY=2026-07-01`: ₹99, free from ₹2,999, Plus free (`shipping_policy` `§2.1`, `§2.2`). With `APP_TODAY=2026-08-01` or later: ₹149, free from ₹4,999, Plus free (`shipping_policy_update` `§1.1`, `§1.2`, `§2.1`). |
 | `C1009`: “Where is SS-10512, and can I return the speaker from SS-10458?” | Both parts answered in one reply: in transit, estimated delivery 3 July 2026; the Nimbra Smart Speaker is eligible if they changed their mind, and the bot offers to start the return (nothing saved). |
 | `C1001`: “Do you ship to Dubai?” | No, ShopSphere delivers only within India. Cites `faq_general` `§6.1`. |
 | `C1001`: “My phone stopped charging. Is it covered?” | The Nimbra One is under warranty until 14 February 2027 and charging faults are covered; cites `warranty_policy` `§3.1` and offers a warranty ticket without proposing one. |
@@ -123,6 +142,7 @@ These examples were checked against the supplied data on `APP_TODAY=2026-07-01`:
 | `C1009`: return the speaker twice | The second request is refused: "A return request already exists for one of these items." |
 
 Return-window boundaries and changed policy parameters (window, warranty months, policy text, manifest dates, `APP_TODAY`) were checked using temporary database copies. The examples above were produced by the live OpenAI path with `gpt-4o-mini`; tool selection and wording remain model-dependent, so wording can differ between runs and models.
+
 
 ## Tests
 

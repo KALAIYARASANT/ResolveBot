@@ -168,6 +168,16 @@ def search_policy(query: str):
         return False
     scored = [e for e in scored if not superseded(e[1], e[3].split(": ", 1)[0])]
 
+    # A transition rule ("Until 1 August 2026, ...") says nothing once that date has arrived.
+    def expired(paragraph):
+        from dateutil import parser
+        match = re.match(r"[^:]*:\s*Until\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", paragraph)
+        try:
+            return bool(match) and parser.parse(match.group(1)).date().isoformat() <= today
+        except (ValueError, OverflowError):
+            return False
+    scored = [e for e in scored if not expired(e[3])]
+
     excerpts, per_document = [], {}
     for _order, doc_id, section, paragraph, _topic in scored:
         if per_document.get(doc_id, 0) >= MAX_PER_DOCUMENT:

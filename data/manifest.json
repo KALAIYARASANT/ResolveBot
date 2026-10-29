@@ -1,0 +1,82 @@
+[
+  {
+    "doc_id": "returns_policy",
+    "file": "policies.md",
+    "title": "ShopSphere Returns Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-04-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "returns_policy_2024",
+    "file": "policies.md",
+    "title": "ShopSphere Returns Policy (2024)",
+    "doc_type": "policy",
+    "effective_date": "2024-01-01",
+    "status": "superseded"
+  },
+  {
+    "doc_id": "refunds_policy",
+    "file": "policies.md",
+    "title": "ShopSphere Refunds Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-04-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "warranty_policy",
+    "file": "policies.md",
+    "title": "ShopSphere Warranty Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-06-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "shipping_policy",
+    "file": "policies.md",
+    "title": "ShopSphere Shipping Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-09-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "shipping_policy_update",
+    "file": "policies.md",
+    "title": "Shipping Policy Update: New Shipping Fees",
+    "doc_type": "policy",
+    "effective_date": "2026-08-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "damaged_or_defective_items",
+    "file": "policies.md",
+    "title": "Damaged or Defective Items Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-04-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "exchanges",
+    "file": "policies.md",
+    "title": "ShopSphere Exchanges Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-04-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "order_cancellation",
+    "file": "policies.md",
+    "title": "Order Cancellation Policy",
+    "doc_type": "policy",
+    "effective_date": "2025-04-01",
+    "status": "current"
+  },
+  {
+    "doc_id": "faq_general",
+    "file": "policies.md",
+    "title": "ShopSphere Help Centre: Frequently Asked Questions",
+    "doc_type": "faq",
+    "effective_date": "2025-01-15",
+    "status": "current"
+  }
+]

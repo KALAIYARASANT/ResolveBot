@@ -5,10 +5,6 @@
 *.pem
 *.p12
 *secret*
-data/*.db
-data/*.sqlite
-data/*.sqlite3
-data/
 .venv/
 venv/
 __pycache__/
@@ -16,3 +12,4 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+TASK.pdf

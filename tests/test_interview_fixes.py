@@ -556,6 +556,30 @@ class InterviewFixTests(unittest.TestCase):
         later = self.excerpts_at("2026-07-31", "What will the shipping fee be from 1 August 2026?")
         self.assertTrue(any(x["doc_id"] == "shipping_policy_update" and x["future"] for x in later))
 
+    def test_fee_and_threshold_question_retrieves_both_update_sections(self):
+        for query in ("What is the shipping fee and free shipping threshold?",
+                      "shipping fees and free-shipping threshold, and does Plus get free shipping?"):
+            with self.subTest(query=query):
+                excerpts = self.excerpts_at("2026-08-01", query)
+                sections = [(x["doc_id"], x["section"]) for x in excerpts]
+                self.assertIn(("shipping_policy_update", "§1.1"), sections)
+                self.assertIn(("shipping_policy_update", "§1.2"), sections)
+                self.assertNotIn(("shipping_policy", "§2.1"), sections)
+                if "Plus" in query:
+                    self.assertIn(("shipping_policy_update", "§2.1"), sections)
+        before = [(x["doc_id"], x["section"]) for x in self.excerpts_at("2026-07-31", "What is the shipping fee and free shipping threshold?")]
+        self.assertIn(("shipping_policy", "§2.1"), before)
+        self.assertFalse(any(doc == "shipping_policy_update" for doc, _ in before))
+
+    def test_ended_transition_rule_is_not_cited(self):
+        for today, present in (("2026-07-31", True), ("2026-08-01", False)):
+            with self.subTest(today=today):
+                sections = [(x["doc_id"], x["section"]) for x in self.excerpts_at(today, "What will the shipping fee be from 1 August 2026?")]
+                self.assertEqual(present, ("shipping_policy_update", "§3.1") in sections)
+        now = [(x["doc_id"], x["section"]) for x in self.excerpts_at("2026-10-30", "What is the shipping fee?")]
+        self.assertIn(("shipping_policy_update", "§1.1"), now)
+        self.assertNotIn(("shipping_policy_update", "§3.1"), now)
+
     def test_combined_shipping_and_address_question_cites_both_parts(self):
         owner, *_ = self.accounts()
         answer, route, calls, citations, *_ = self.chat(
