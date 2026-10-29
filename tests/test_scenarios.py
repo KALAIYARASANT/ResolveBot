@@ -51,6 +51,8 @@ class ResolveBotScenarioTests(unittest.TestCase):
         self.old_policies_path = self.settings.policies_path
         self.old_manifest_path = self.settings.manifest_path
         self.old_today = self.settings.app_today
+        self.old_key = self.settings.openai_api_key
+        self.settings.openai_api_key = ""
         self.old_rules_today = business_rules.TODAY
         self.settings.db_path = self.db_path
         self.settings.policies_path = ROOT / "data" / "policies.md"
@@ -63,6 +65,7 @@ class ResolveBotScenarioTests(unittest.TestCase):
         self.settings.policies_path = self.old_policies_path
         self.settings.manifest_path = self.old_manifest_path
         self.settings.app_today = self.old_today
+        self.settings.openai_api_key = self.old_key
         business_rules.TODAY = self.old_rules_today
         self.temp.cleanup()
 
@@ -261,7 +264,8 @@ class ResolveBotScenarioTests(unittest.TestCase):
             self.assertFalse(result[4])
             self.assertIsNone(result[5])
         self.assertEqual("clarify",imperative[1])
-        self.assertIn("won't submit",no_result[0])
+        self.assertIn("declined",no_result[0].facts["situation"])
+        self.assertIn("not submitted",no_result[0].facts["situation"])
         self.assertEqual(before,(self.table_count("return_requests"),self.table_count("support_tickets")))
 
     def test_yearless_dates_use_2026_without_rewriting_explicit_year(self):
@@ -395,9 +399,8 @@ class ResolveBotScenarioTests(unittest.TestCase):
         self.assertEqual("clarify", route)
         self.assertEqual("get_orders", calls[0]["name"])
         self.assertEqual({}, calls[0]["args"])
-        for order_id in order_ids:
-            self.assertIn(order_id, answer)
-        self.assertIn("Which one", answer)
+        self.assertEqual(order_ids, answer.facts["orders_on_account"])
+        self.assertEqual(["which order"], answer.facts["ask"])
         self.assertFalse(citations)
         self.assertFalse(pending)
         self.assertIsNone(proposal)
@@ -415,10 +418,10 @@ class ResolveBotScenarioTests(unittest.TestCase):
             self.assertEqual("clarify", route)
             self.assertEqual("get_orders", calls[0]["name"])
             self.assertTrue(product_names)
-            self.assertTrue(any(name in answer for name in product_names))
-            self.assertIn("Which item do you mean", answer)
-            self.assertIn("changed your mind", answer)
-            self.assertIn("item is defective", answer)
+            self.assertTrue(product_names)
+            self.assertEqual(product_names, {item["name"] for item in answer.facts["account_items"]})
+            self.assertEqual("which item they mean", answer.facts["ask"][0])
+            self.assertIn("change their mind", answer.facts["ask"][1])  # the reason is asked together, never assumed
             self.assertFalse(citations)
             self.assertFalse(pending)
             self.assertIsNone(proposal)
@@ -431,20 +434,24 @@ class ResolveBotScenarioTests(unittest.TestCase):
         first=run_chat(customer,[],"Voltix 30W Car Charger return send back?",None)
         answer,route,calls,_citations,pending,proposal=first
         self.assertEqual("clarify",route)
-        self.assertIn("reason",answer)
-        self.assertIn("changed your mind",answer)
-        self.assertEqual(["get_orders"],[call["name"] for call in calls])
+        self.assertIn("change their mind",answer.facts["ask"][0])
+        self.assertTrue(answer.facts["can_be_returned"])
+        self.assertEqual(["get_orders","search_policy","check_return_eligibility","check_return_eligibility"],[call["name"] for call in calls])
+        self.assertEqual(["changed_mind","defective"],[call["args"]["reason"] for call in calls[2:]])
         self.assertFalse(pending)
         self.assertIsNone(proposal)
         self.assertNotIn("reason",calls[0]["args"])
 
-        history=[HumanMessage(content="Voltix 30W Car Charger return send back?"),AIMessage(content=answer)]
+        history=[HumanMessage(content="Voltix 30W Car Charger return send back?"),
+                 AIMessage(content=str(answer),additional_kwargs={"context":answer.context})]
         after_yes=run_chat(customer,history,"yes",None)
         self.assertEqual("clarify",after_yes[1])
-        self.assertIn("reason",after_yes[0])
+        self.assertIn("not with a return reason",after_yes[0].facts["situation"])
+        self.assertEqual(answer.context["selected"],after_yes[0].facts["item"])  # the item is kept, not re-searched
+        self.assertEqual([],after_yes[2])
         self.assertFalse(after_yes[4])
         self.assertIsNone(after_yes[5])
-        self.assertFalse(any(call["name"] in {"check_return_eligibility","create_return_request"} for call in after_yes[2]))
+        self.assertFalse(any(call["name"]=="create_return_request" for call in after_yes[2]))
 
     def test_product_name_answers_return_clarification_without_guessing_reason(self):
         customer="C1001"
@@ -454,18 +461,19 @@ class ResolveBotScenarioTests(unittest.TestCase):
         ))]
         identified=run_chat(customer,history,"car charger",None)
         self.assertEqual("clarify",identified[1])
-        self.assertIn("Voltix 30W Car Charger",identified[0])
-        self.assertIn("changed your mind",identified[0])
-        self.assertEqual(["get_orders"],[call["name"] for call in identified[2]])
+        self.assertEqual("Voltix 30W Car Charger",identified[0].facts["item"]["name"])
+        self.assertIn("change their mind",identified[0].facts["ask"][0])
+        self.assertEqual(["get_orders","search_policy","check_return_eligibility","check_return_eligibility"],[call["name"] for call in identified[2]])
         self.assertFalse(identified[4])
         self.assertIsNone(identified[5])
-        history.extend([HumanMessage(content="car charger"),AIMessage(content=identified[0])])
+        history.extend([HumanMessage(content="car charger"),
+                        AIMessage(content=str(identified[0]),additional_kwargs={"context":identified[0].context})])
         yes_without_reason=run_chat(customer,history,"yes",None)
         self.assertEqual("clarify",yes_without_reason[1])
-        self.assertIn("reason",yes_without_reason[0])
+        self.assertIn("not with a return reason",yes_without_reason[0].facts["situation"])
         self.assertFalse(yes_without_reason[4])
         self.assertIsNone(yes_without_reason[5])
-        self.assertFalse(any(call["name"] in {"check_return_eligibility","create_return_request"} for call in yes_without_reason[2]))
+        self.assertFalse(any(call["name"]=="create_return_request" for call in yes_without_reason[2]))
 
     def test_yes_to_general_return_offer_becomes_proposal_then_compound_yes_confirms(self):
         with self.connect() as db:
@@ -535,6 +543,9 @@ class ResolveBotScenarioTests(unittest.TestCase):
             def bind_tools(self, tools):
                 return FakeBoundModel()
 
+            def invoke(self, messages):  # unbound: the model's closing question once the tool limit is reached
+                return AIMessage(content="Which item do you mean?")
+
         graph, _ = _build_graph(customer, FakeModel(), {}, allow_proposals=False)
         result = graph.invoke({
             "messages":[HumanMessage(content="check these items")],
@@ -545,7 +556,7 @@ class ResolveBotScenarioTests(unittest.TestCase):
         self.assertEqual(9, len(result["tool_calls"]))
         self.assertEqual(4, sum(c["status"] == "success" for c in result["tool_calls"]))
         self.assertEqual(5, sum(c["status"] == "error" for c in result["tool_calls"]))
-        self.assertIn("Which item do you mean", result["messages"][-1].content)
+        self.assertEqual("Which item do you mean?", result["messages"][-1].content)
 
     def test_calls_emitted_after_cumulative_limit_are_recorded_and_not_reissued(self):
         with self.connect() as db:
@@ -556,9 +567,19 @@ class ResolveBotScenarioTests(unittest.TestCase):
                 self.calls = 0
 
             def bind_tools(self, tools):
-                return self
+                return self.Bound(self)
 
-            def invoke(self, messages):
+            class Bound:
+                def __init__(self, outer):
+                    self.outer = outer
+
+                def invoke(self, messages):
+                    return self.outer.tool_batch()
+
+            def invoke(self, messages):  # unbound: the model's closing question once the tool limit is reached
+                return AIMessage(content="Which item do you mean?")
+
+            def tool_batch(self):
                 batch = 6 if self.calls == 0 else 2
                 base = 0 if self.calls == 0 else 6
                 self.calls += 1
@@ -579,7 +600,7 @@ class ResolveBotScenarioTests(unittest.TestCase):
         self.assertEqual(8, len(result["tool_calls"]))
         self.assertEqual(6, sum(c["status"] == "success" for c in result["tool_calls"]))
         self.assertEqual(2, sum(c["status"] == "error" for c in result["tool_calls"]))
-        self.assertIn("Which item do you mean", result["messages"][-1].content)
+        self.assertEqual("Which item do you mean?", result["messages"][-1].content)
 
 
 if __name__ == "__main__":

@@ -132,6 +132,9 @@ def _validate_ticket(db, customer_id, order_id, ticket_type, summary):
         checked = _check_warranty(db, customer_id, order_id)
         if not checked["eligible"]:
             return checked
+        if db.execute("SELECT 1 FROM support_tickets WHERE customer_id=? AND order_id=? AND ticket_type='warranty' AND status='open' AND summary=?",
+                      (customer_id, order_id, summary)).fetchone():
+            return _result(False, "ALREADY_REQUESTED", "A warranty ticket with this description is already open for this order.")
     elif order["status"] != "processing":
         return _result(False, "ORDER_ALREADY_SHIPPED", "This order can no longer be cancelled because it has shipped.")
     elif db.execute("SELECT 1 FROM support_tickets WHERE customer_id=? AND order_id=? AND ticket_type='cancellation' AND status='open'",

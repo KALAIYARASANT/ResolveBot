@@ -100,8 +100,11 @@ async def chat(request: Request, x_customer_id: str | None = Header(default=None
         elif not (session.confirmed_action_reply and is_clear_confirmation(body.message)):
             session.confirmed_action_reply = None
         session.pending = new_proposal
-        session.history.extend([HumanMessage(content=body.message), AIMessage(content=answer)])
+        # The turn's context (what the reply is waiting for) travels with the message, so the next turn does not
+        # have to re-read the wording.
+        session.history.extend([HumanMessage(content=body.message),
+                                AIMessage(content=str(answer), additional_kwargs={"context": getattr(answer, "context", None)})])
         del session.history[:-MAX_HISTORY_MESSAGES]
         session.last_used = time.monotonic()
-    return {"request_id": request_id, "answer": answer, "route": route, "citations": citations,
+    return {"request_id": request_id, "answer": str(answer), "route": route, "citations": citations,
             "tool_calls": calls, "pending_confirmation": pending}

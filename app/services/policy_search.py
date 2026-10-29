@@ -15,7 +15,7 @@ _SYNONYMS = {
     **dict.fromkeys(("fee", "fees", "cost", "costs", "charge", "charges"), "cost"),
 }
 MAX_EXCERPTS = 5
-MAX_PER_DOCUMENT = 2  # keeps one busy document from crowding out the FAQ or a neighbouring policy
+MAX_PER_DOCUMENT = 3  # keeps one busy document from crowding out the FAQ or a neighbouring policy
 
 
 def _term(word: str) -> str:
@@ -70,6 +70,22 @@ def _documents(text: str):
         yield match.group(1), [(s["section"], s["heading"], "\n".join(s["lines"])) for s in sections if s["lines"]]
 
 
+_QUERY_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b(?:\d{1,2}(?:st|nd|rd|th)?\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(?:\s+\d{1,2}(?:st|nd|rd|th)?,?)?\s+\d{4}\b|\b20\d{2}\b", re.I)
+
+
+def _names_later_date(query: str, today: str) -> bool:
+    """True when the query names a date after the business date (today's own date is not a future policy)."""
+    from dateutil import parser
+    for match in _QUERY_DATE.finditer(query):
+        try:  # a month and year alone means the first of that month; a bare year, 1 January
+            when = parser.parse(match.group(0), default=parser.parse("2000-01-01")).date().isoformat()
+        except (ValueError, OverflowError):
+            continue
+        if when > today:
+            return True
+    return False
+
+
 def search_policy(query: str):
     settings = get_settings()
     try:
@@ -81,7 +97,7 @@ def search_policy(query: str):
     documents = dict(_documents(policy_text))
     today = settings.app_today
     # A document that has not started yet is considered only when the question is about the future.
-    future_intent = bool(re.search(r"\b(after|from|starting|effective|upcoming|future|next)\b|202[6-9]", query, re.I))
+    future_intent = bool(re.search(r"\b(after|from|starting|effective|upcoming|future|next)\b", query, re.I)) or _names_later_date(query, today)
     valid = {
         entry["doc_id"]: entry for entry in manifest
         if entry["doc_id"] in documents and entry["status"] == "current"
@@ -112,9 +128,19 @@ def search_policy(query: str):
             same_topic = (frozenset(matched), frozenset(terms & heading_terms))
             scored.append((order, doc_id, section, f"{heading}: {body}", same_topic))
     scored.sort(key=lambda entry: entry[0])
-    if scored:
-        floor = max(-scored[0][0][0] - 1, 0)
-        scored = [entry for entry in scored if -entry[0][0] >= floor]
+    # Keep sections within one point of the best match, separately for documents in force and future ones, so a
+    # strongly matching future notice cannot push out the policy that applies today.
+    best = {}
+    for entry in scored:
+        group = valid[entry[1]]["effective_date"] > today
+        best[group] = max(best.get(group, 0), -entry[0][0])
+    # A question can ask for two facts that sit side by side in one notice (a fee and a threshold); a sibling section
+    # under the same heading in the same document as a kept match stays even if it scores a little lower.
+    def parent(entry):
+        return entry[1], entry[3].split(" / ", 1)[0] if " / " in entry[3].split(": ", 1)[0] else None
+    kept = [e for e in scored if -e[0][0] >= max(best[valid[e[1]]["effective_date"] > today] - 1, 0)]
+    families = {parent(e) for e in kept if parent(e)[1]}
+    scored = [e for e in scored if e in kept or parent(e) in families]
 
     # Two in-force policy sections about the same topic (same heading terms, same matched terms) can disagree
     # when a newer document changes an older one; the newer document wins. FAQs and future documents are exempt.
@@ -125,6 +151,22 @@ def search_policy(query: str):
         if topic[1] and in_force_policy(doc_id):
             newest[topic] = max(newest.get(topic, ""), valid[doc_id]["effective_date"])
     scored = [e for e in scored if not (e[4][1] and in_force_policy(e[1]) and valid[e[1]]["effective_date"] < newest[e[4]])]
+
+    # A newer in-force policy document that names an older one (an update notice) replaces the older sections whose
+    # heading it repeats with more words ("Standard shipping fee" -> "New standard shipping fee"), even when the
+    # replacement was not itself retrieved. Sections it does not restate (for example Plus membership) stay.
+    def superseded(doc_id, heading):
+        old_terms = significant_terms(heading)
+        if len(old_terms) < 2 or not in_force_policy(doc_id):
+            return False
+        for newer_id, newer in valid.items():
+            if (newer_id == doc_id or not in_force_policy(newer_id) or newer["effective_date"] <= valid[doc_id]["effective_date"]
+                    or not any(doc_id in body for _s, _h, body in documents[newer_id])):
+                continue
+            if any(old_terms <= significant_terms(newer_heading) for _s, newer_heading, _b in documents[newer_id]):
+                return True
+        return False
+    scored = [e for e in scored if not superseded(e[1], e[3].split(": ", 1)[0])]
 
     excerpts, per_document = [], {}
     for _order, doc_id, section, paragraph, _topic in scored:

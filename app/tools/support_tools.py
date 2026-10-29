@@ -17,8 +17,8 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
     """Tool closures bind trusted customer identity from HTTP, never model arguments."""
     proposal_state: dict = {}
     @tool
-    def get_orders(order_id: Optional[str] = None, status: Optional[str] = None) -> dict:
-        """Get only the authenticated customer's orders, including items, tracking and warranty dates. Filter by optional order_id or status."""
+    def get_orders(order_id: Optional[str] = None, status: Optional[str] = None, order_date: Optional[str] = None) -> dict:
+        """Get only the authenticated customer's orders, including items, tracking and warranty dates. Filter by optional order_id, status or order_date (YYYY-MM-DD)."""
         with connect() as db:
             sql = "SELECT * FROM orders WHERE customer_id=?"
             params = [customer_id]
@@ -26,6 +26,8 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
                 sql += " AND order_id=?"; params.append(normalize_id(order_id))
             if status:
                 sql += " AND status=?"; params.append(status)
+            if order_date:
+                sql += " AND substr(order_date,1,10)=?"; params.append(order_date)
             orders = db.execute(sql + " ORDER BY order_date DESC", params).fetchall()
             result = []
             for order in orders:
@@ -53,7 +55,10 @@ def build_tools(customer_id: str, proposal_callback, allow_proposals: bool = Tru
     @tool
     def search_policy(query: str) -> dict:
         """Search current ShopSphere policies and FAQs. Returns only applicable excerpts with citation doc_id and section. Include any date the customer mentions in the query."""
-        return retrieve_policy(query)
+        result = retrieve_policy(query)
+        if not result.get("covered") and not result.get("error"):
+            result = {**result, "note": "No current ShopSphere policy covers this. Tell the customer the policies do not cover it and suggest emailing the support team. Do not guess."}
+        return result
 
     @tool
     def check_return_eligibility(order_id: str, item_ids: list[str], reason: str) -> dict:
